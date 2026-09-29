@@ -1,163 +1,192 @@
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
+import pandas as pd
+import numpy as np
 from datetime import datetime
 
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
-
 app = FastAPI(
-    title="Coordinate Data / Excel Processing API",
-    description="API для преобразования координатных данных из Excel "
-                "с использованием семипараметрического преобразования Гельмерта",
-    version="1.0.0",
+    title="Coordinate Transformation API",
+    description="API для преобразования координатных данных из Excel",
+    version="1.0.0"
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def read_root():
     return {
-        "message": "Excel processing API работает",
+        "message": "Coordinate Transformation API работает",
         "endpoints": {
-            "/": "Проверка доступности API",
-            "/process-excel/": "Загрузка Excel и получение Markdown-отчета",
-        },
+            "/transform-coordinates/": "POST: загрузка Excel и преобразование координат"
+        }
     }
 
-
-def transform_coordinates(df: pd.DataFrame, p: dict) -> pd.DataFrame:
-    """
-    7-параметрическое преобразование Гельмерта:
-    [X']   [dX]         [1    -wz   wy]  [X]
-    [Y'] = [dY] + (1+m) [wz    1   -wx] *[Y]
-    [Z']   [dZ]         [-wy   wx    1]  [Z]
-    """
-    dX, dY, dZ = p["dX"], p["dY"], p["dZ"]
-    wx, wy, wz = p["wx"], p["wy"], p["wz"]
-    m = p["m"]
-
-    X = df["X"].astype(float).values
-    Y = df["Y"].astype(float).values
-    Z = df["Z"].astype(float).values
-
-    X_new = dX + (1 + m) * (X - wz * Y + wy * Z)
-    Y_new = dY + (1 + m) * (wz * X + Y - wx * Z)
-    Z_new = dZ + (1 + m) * (-wy * X + wx * Y + Z)
-
-    df_out = df.copy()
-    df_out["X'"] = X_new.round(6)
-    df_out["Y'"] = Y_new.round(6)
-    df_out["Z'"] = Z_new.round(6)
-    return df_out
-
-
-def generate_markdown_report(df: pd.DataFrame) -> str:
-    report = "# Отчет по анализу данных\n\n"
-    report += f"Дата создания: {datetime.now():%Y-%m-%d %H:%M:%S}\n\n"
-
-    report += "## Общая информация\n\n"
-    report += f"- **Количество строк**: {df.shape[0]}\n"
-    report += f"- **Количество столбцов**: {df.shape[1]}\n"
-    report += f"- **Столбцы**: {', '.join(map(str, df.columns))}\n\n"
-
-    numeric_columns = df.select_dtypes(include="number").columns.tolist()
-    if numeric_columns:
-        report += "## Статистический анализ\n\n"
-        report += "### Числовые данные\n\n"
-        stats = df[numeric_columns].describe().transpose()
-        report += (
-            "| Столбец | Количество | Среднее | Ст. отклонение | "
-            "Мин | 25% | 50% | 75% | Макс |\n"
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
-        )
-        for column, row in stats.iterrows():
-            report += (
-                f"| {column} | {row['count']:.0f} | {row['mean']:.2f} | "
-                f"{row['std']:.2f} | {row['min']:.2f} | {row['25%']:.2f} | "
-                f"{row['50%']:.2f} | {row['75%']:.2f} | {row['max']:.2f} |\n"
-            )
-        report += "\n"
-
-    categorical_columns = df.select_dtypes(
-        include=["object", "category"]
-    ).columns.tolist()
-    if categorical_columns:
-        report += "### Категориальные данные\n\n"
-        for column in categorical_columns:
-            report += f"#### {column}\n\n"
-            report += "| Значение | Количество | Процент |\n|---|---:|---:|\n"
-            for value, count in df[column].value_counts(dropna=False).head(5).items():
-                label = "NaN" if pd.isna(value) else str(value)
-                report += f"| {label} | {count} | {count / len(df) * 100:.2f}% |\n"
-            report += "\n"
-
-    missing = df.isna().sum()
-    report += "## Анализ пропущенных значений\n\n"
-    if missing.sum():
-        report += "| Столбец | Пропущенные значения | Процент пропущенных |\n"
-        report += "|---|---:|---:|\n"
-        for column, count in missing.items():
-            if count:
-                report += f"| {column} | {count} | {count / len(df) * 100:.2f}% |\n"
-        report += "\n"
+def validate_columns(df: pd.DataFrame, mode: str):
+    if mode == "cartesian_to_polar":
+        required = ["x", "y"]
+    elif mode == "polar_to_cartesian":
+        required = ["r", "theta"]
+    elif mode == "affine":
+        required = ["x", "y"]
     else:
-        report += "Пропущенные значения отсутствуют.\n\n"
+        raise HTTPException(status_code=400, detail=f"Неизвестный режим: {mode}")
 
-    report += "## Выводы\n\n"
-    report += (
-        f"1. Набор содержит {df.shape[0]} записей и "
-        f"{df.shape[1]} характеристик.\n"
-    )
-    if numeric_columns:
-        column = df[numeric_columns].mean().idxmax()
-        report += (
-            f"2. Среди числовых столбцов наибольшее среднее значение "
-            f"имеет «{column}» ({df[column].mean():.2f}).\n"
-        )
-    if missing.sum():
-        column = missing.idxmax()
-        report += (
-            f"3. Наибольшее число пропусков находится в столбце "
-            f"«{column}» ({missing.max()}).\n"
-        )
-    return report
-
-
-@app.post("/process-excel/")
-async def process_excel(file: UploadFile = File(...)):
-    filename = file.filename or ""
-    if not filename.lower().endswith((".xlsx", ".xls")):
+    missing = [col for col in required if col not in df.columns]
+    if missing:
         raise HTTPException(
             status_code=400,
-            detail="Поддерживаются только файлы Excel (.xlsx, .xls)",
+            detail=f"В файле отсутствуют обязательные столбцы: {', '.join(missing)}"
+        )
+    return required
+
+def transform_coordinates(
+    df: pd.DataFrame,
+    mode: str,
+    angle_unit: str,
+    precision: int,
+    affine_params: tuple
+) -> pd.DataFrame:
+    df_out = df.copy()
+
+    if mode == "cartesian_to_polar":
+        x = df["x"].astype(float)
+        y = df["y"].astype(float)
+        r = np.sqrt(x ** 2 + y ** 2)
+        theta = np.arctan2(y, x)
+        if angle_unit == "degrees":
+            theta = np.degrees(theta)
+        df_out["r"] = r.round(precision)
+        df_out["theta"] = theta.round(precision)
+
+    elif mode == "polar_to_cartesian":
+        r = df["r"].astype(float)
+        theta = df["theta"].astype(float)
+        if angle_unit == "degrees":
+            theta_rad = np.radians(theta)
+        else:
+            theta_rad = theta
+        df_out["x"] = (r * np.cos(theta_rad)).round(precision)
+        df_out["y"] = (r * np.sin(theta_rad)).round(precision)
+
+    elif mode == "affine":
+        a, b, c, d, e, f = affine_params
+        x = df["x"].astype(float)
+        y = df["y"].astype(float)
+        df_out["x_new"] = (a * x + b * y + c).round(precision)
+        df_out["y_new"] = (d * x + e * y + f).round(precision)
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Неизвестный режим: {mode}")
+
+    return df_out
+
+def df_to_markdown_table(df: pd.DataFrame, max_rows: int = 20) -> str:
+    if len(df) > max_rows:
+        df = df.head(max_rows)
+    try:
+        return df.to_markdown(index=False)
+    except Exception:
+        cols = df.columns
+        lines = [
+            "| " + " | ".join(cols) + " |",
+            "| " + " | ".join(["---"] * len(cols)) + " |"
+        ]
+        for _, row in df.iterrows():
+            lines.append("| " + " | ".join(str(row[c]) for c in cols) + " |")
+        return "\n".join(lines)
+
+def generate_markdown_report(
+    df_in: pd.DataFrame,
+    df_out: pd.DataFrame,
+    mode: str,
+    params: dict
+) -> str:
+    report = "# Отчет о преобразовании координатных данных\n\n"
+    report += f"**Дата создания:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+
+    report += "## Параметры преобразования\n\n"
+    report += f"- **Режим:** {mode}\n"
+    report += f"- **Единицы измерения углов:** {params.get('angle_unit', 'degrees')}\n"
+    report += f"- **Точность:** {params.get('precision', 6)} знаков после запятой\n"
+
+    if mode == "affine":
+        a, b, c, d, e, f = params["affine_params"]
+        report += "- **Аффинное преобразование:**\n"
+        report += f"  - x' = {a}·x + {b}·y + {c}\n"
+        report += f"  - y' = {d}·x + {e}·y + {f}\n"
+
+    report += "\n## Входные данные\n\n"
+    report += f"- **Количество записей:** {len(df_in)}\n"
+    report += f"- **Столбцы:** {', '.join(df_in.columns)}\n\n"
+    report += "### Первые 10 строк входных данных\n\n"
+    report += df_to_markdown_table(df_in.head(10)) + "\n\n"
+
+    report += "## Результаты преобразования\n\n"
+    report += f"- **Количество записей:** {len(df_out)}\n"
+    new_cols = set(df_out.columns) - set(df_in.columns)
+    report += f"- **Новые/изменённые столбцы:** {', '.join(new_cols) if new_cols else 'нет'}\n\n"
+    report += "### Первые 20 строк результата\n\n"
+    report += df_to_markdown_table(df_out.head(20)) + "\n\n"
+
+    numeric_cols = df_out.select_dtypes(include=[np.number]).columns.tolist()
+    if numeric_cols:
+        report += "## Статистика по числовым столбцам результата\n\n"
+        stats = df_out[numeric_cols].describe().transpose()
+        report += stats.to_markdown() + "\n\n"
+
+    report += "## Выводы\n\n"
+    report += f"Преобразование выполнено успешно. Обработано {len(df_out)} записей.\n"
+    return report
+
+@app.post("/transform-coordinates/")
+async def transform_coordinates_endpoint(
+    file: UploadFile = File(...),
+    mode: str = Form("cartesian_to_polar"),
+    angle_unit: str = Form("degrees"),
+    precision: int = Form(6),
+    affine_a: float = Form(1.0),
+    affine_b: float = Form(0.0),
+    affine_c: float = Form(0.0),
+    affine_d: float = Form(0.0),
+    affine_e: float = Form(1.0),
+    affine_f: float = Form(0.0),
+):
+    if not file.filename.endswith((".xlsx", ".xls")):
+        raise HTTPException(
+            status_code=400,
+            detail="Поддерживаются только файлы Excel (.xlsx, .xls)"
         )
 
     try:
         contents = await file.read()
-        if not contents:
-            raise HTTPException(status_code=400, detail="Файл пустой")
-
         df = pd.read_excel(BytesIO(contents))
-        if df.empty:
-            raise HTTPException(status_code=400, detail="Excel-файл не содержит строк")
 
-        transformed = transform_coordinates(df)
-        report = generate_markdown_report(transformed)
+        validate_columns(df, mode)
 
-        output = BytesIO(report.encode("utf-8"))
-        output.seek(0)
-        report_name = f"report_{datetime.now():%Y%m%d_%H%M%S}.md"
+        affine_params = (affine_a, affine_b, affine_c, affine_d, affine_e, affine_f)
+        df_out = transform_coordinates(df, mode, angle_unit, precision, affine_params)
 
-        return StreamingResponse(
-            output,
-            media_type="text/markdown; charset=utf-8",
-            headers={
-                "Content-Disposition": f'attachment; filename="{report_name}"'
-            },
-        )
+        params = {
+            "angle_unit": angle_unit,
+            "precision": precision,
+            "affine_params": affine_params,
+        }
+        report = generate_markdown_report(df, df_out, mode, params)
+
+        return {
+            "markdown_report": report,
+            "processed_data": df_out.head(100).to_dict(orient="records"),
+            "filename": f"coordinate_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        }
+
     except HTTPException:
         raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Ошибка обработки файла: {exc}",
-        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка обработки файла: {str(e)}")

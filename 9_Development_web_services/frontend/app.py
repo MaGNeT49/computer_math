@@ -1,106 +1,133 @@
-import io
+import streamlit as st
+import pandas as pd
+import requests
 import os
 from urllib.parse import urljoin
 
-import pandas as pd
-import requests
-import streamlit as st
-
 st.set_page_config(
-    page_title="Анализатор Excel",
+    page_title="Coordinate Transformer",
     layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-BACKEND_URL = os.getenv(
-    "BACKEND_URL",
-    "https://excel-to-markdown-api.onrender.com",
-).rstrip("/")
-
-
-def check_api_status() -> bool:
+# URL бэкенда. Замените на свой после развёртывания на render.com
+def get_backend_url() -> str:
+    """Определяет URL бэкенда: env → secrets → локальный дефолт."""
+    # 1. Переменная окружения (удобно для Docker / CI)
+    url = os.environ.get("BACKEND_URL")
+    if url:
+        return url
+    # 2. Streamlit secrets (если файл существует)
     try:
-        response = requests.get(BACKEND_URL, timeout=10)
-        return response.ok
+        return st.secrets["BACKEND_URL"]
+    except Exception:
+        pass
+    # 3. Локальный дефолт
+    return "http://127.0.0.1:8000"
+
+BACKEND_URL = get_backend_url()
+
+def check_api_status():
+    try:
+        r = requests.get(BACKEND_URL, timeout=10)
+        return r.status_code == 200
     except requests.RequestException:
         return False
 
-
-def process_excel(uploaded_file):
-    url = urljoin(BACKEND_URL + "/", "process-excel/")
-    files = {
-        "file": (
-            uploaded_file.name,
-            uploaded_file.getvalue(),
-            uploaded_file.type or "application/octet-stream",
-        )
-    }
+def send_transform(file, params):
+    url = urljoin(BACKEND_URL, "/transform-coordinates/")
+    files = {"file": file}
     try:
-        response = requests.post(url, files=files, timeout=120)
-        if response.ok:
-            return response.content.decode("utf-8")
-        st.error(f"Ошибка API: {response.status_code}: {response.text}")
-    except requests.RequestException as exc:
-        st.error(f"Ошибка соединения с API: {exc}")
-    return None
-
+        r = requests.post(url, files=files, data=params)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            st.error(f"Ошибка API: {r.status_code} — {r.text}")
+            return None
+    except requests.RequestException as e:
+        st.error(f"Ошибка соединения с API: {e}")
+        return None
 
 def main():
-    st.title("Анализатор Excel-файлов")
-    st.write(
-        "Загрузите Excel-файл. Бэкенд обработает данные и вернет "
-        "отчет в формате Markdown."
-    )
+    st.title("🌐 Преобразование координатных данных")
+    st.markdown("""
+    Загрузите Excel-файл с координатами, выберите режим преобразования
+    и получите отчёт в формате Markdown.
+    """)
 
-    with st.sidebar:
-        st.subheader("Параметры")
-        st.code(BACKEND_URL)
-        if check_api_status():
-            st.success("API доступен")
-        else:
-            st.error("API недоступен")
-
-    uploaded_file = st.file_uploader(
-        "Выберите Excel-файл",
-        type=["xlsx", "xls"],
-    )
-
-    if uploaded_file is None:
+    if not check_api_status():
+        st.error("⚠️ Бэкенд недоступен. Проверьте URL или попробуйте позже.")
         return
 
-    try:
-        df = pd.read_excel(io.BytesIO(uploaded_file.getvalue()))
+    with st.sidebar:
+        st.header("Параметры преобразования")
+        mode = st.selectbox(
+            "Режим",
+            ["cartesian_to_polar", "polar_to_cartesian", "affine"],
+            format_func=lambda x: {
+                "cartesian_to_polar": "Декартовы → Полярные",
+                "polar_to_cartesian": "Полярные → Декартовы",
+                "affine": "Аффинное преобразование"
+            }[x]
+        )
+        angle_unit = st.radio("Единицы углов", ["degrees", "radians"], index=0)
+        precision = st.slider("Точность (знаков после запятой)", 1, 12, 6)
 
-        st.subheader("Предварительный просмотр")
-        st.dataframe(df.head(10), use_container_width=True)
+        affine_params = {}
+        if mode == "affine":
+            st.subheader("Параметры аффинного преобразования")
+            a = st.number_input("a", value=1.0)
+            b = st.number_input("b", value=0.0)
+            c = st.number_input("c", value=0.0)
+            d = st.number_input("d", value=0.0)
+            e = st.number_input("e", value=1.0)
+            f = st.number_input("f", value=0.0)
+            affine_params = {
+                "affine_a": a, "affine_b": b, "affine_c": c,
+                "affine_d": d, "affine_e": e, "affine_f": f
+            }
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Строки", df.shape[0])
-        c2.metric("Столбцы", df.shape[1])
-        c3.metric("Пропуски", int(df.isna().sum().sum()))
+    uploaded_file = st.file_uploader("Выберите Excel-файл", type=["xlsx", "xls"])
 
-        numeric = df.select_dtypes(include="number").columns.tolist()
-        if numeric:
-            st.subheader("Визуализация числовых данных")
-            selected = st.selectbox("Числовой столбец", numeric)
-            st.line_chart(df[selected])
+    if uploaded_file is not None:
+        try:
+            df_preview = pd.read_excel(uploaded_file)
+            st.subheader("Предварительный просмотр данных")
+            st.dataframe(df_preview.head(10))
+            uploaded_file.seek(0)
+        except Exception as e:
+            st.error(f"Ошибка чтения файла: {e}")
+            return
 
-        if st.button("Анализировать", type="primary"):
-            with st.spinner("Обрабатываем файл..."):
-                report = process_excel(uploaded_file)
+        if st.button("Выполнить преобразование", type="primary"):
+            params = {
+                "mode": mode,
+                "angle_unit": angle_unit,
+                "precision": precision,
+                **affine_params
+            }
+            with st.spinner("Отправка файла на сервер..."):
+                result = send_transform(uploaded_file, params)
 
-            if report:
-                st.success("Отчет успешно создан")
-                st.subheader("Markdown-отчет")
+            if result:
+                st.success("Преобразование выполнено успешно!")
+                report = result["markdown_report"]
+
+                st.subheader("Отчёт")
                 st.markdown(report)
-                st.download_button(
-                    "Скачать report.md",
-                    data=report,
-                    file_name="report.md",
-                    mime="text/markdown",
-                )
-    except Exception as exc:
-        st.error(f"Ошибка чтения Excel-файла: {exc}")
 
+                st.download_button(
+                    label="Скачать отчёт (Markdown)",
+                    data=report,
+                    file_name=result.get("filename", "report.md"),
+                    mime="text/markdown"
+                )
+
+                if "processed_data" in result:
+                    st.subheader("Обработанные данные (первые 100 строк)")
+                    st.dataframe(pd.DataFrame(result["processed_data"]))
+    else:
+        st.info("Загрузите Excel-файл, чтобы начать.")
 
 if __name__ == "__main__":
     main()
